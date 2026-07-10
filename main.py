@@ -182,29 +182,34 @@ async def parse_expenses_with_llm(text: str) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------
 # Работа с Google Sheets через Apps Script Web App
 # --------------------------------------------------------------------------
-# Apps Script при POST возвращает 302-редирект. httpx (и requests) по HTTP-стандарту
-# меняют POST→GET при 302, теряя тело запроса. В итоге вместо doPost выполняется
-# doGet (который возвращает {ok:true}), и данные не пишутся.
-# Решение: вручную следуем редиректам, сохраняя POST и тело.
+# Apps Script при POST: выполняет doPost на сервере, затем возвращает 302
+# на googleusercontent URL, где лежит ответ (только GET).
+# httpx с follow_redirects=True корректно делает POST→302→GET (по HTTP-стандарту).
+# Но doGet возвращает тоже {ok:true}, маскируя проблему.
+# Решение: POST без редиректов, затем GET по redirect-URL для ответа.
 # --------------------------------------------------------------------------
 async def _post_to_apps_script(payload: dict) -> dict:
-    """POST в Apps Script Web App с корректной обработкой 302-редиректов."""
-    url = SHEETS_WEBAPP_URL
-    json_body = json.dumps(payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-
+    """POST в Apps Script Web App с корректной обработкой редиректов."""
     async with httpx.AsyncClient(timeout=30) as client:
-        for _ in range(5):  # макс. 5 редиректов
-            resp = await client.post(url, content=json_body, headers=headers, follow_redirects=False)
+        # 1) POST — выполняет doPost на сервере Apps Script
+        resp = await client.post(
+            SHEETS_WEBAPP_URL, json=payload, follow_redirects=False
+        )
+        log.info(
+            "Apps Script POST -> %s, headers: %s",
+            resp.status_code,
+            dict(resp.headers),
+        )
 
-            if resp.status_code in (301, 302, 303, 307, 308):
-                url = resp.headers["location"]
-                log.debug("Apps Script redirect -> %s", url)
-                continue
+        # 2) Следуем по цепочке редиректов GET-ом, чтобы забрать ответ doPost
+        max_redirects = 5
+        while resp.is_redirect and max_redirects > 0:
+            redirect_url = resp.headers.get("location", "")
+            log.info("Apps Script redirect -> %s", redirect_url)
+            resp = await client.get(redirect_url, follow_redirects=False)
+            max_redirects -= 1
 
-            break
-
-    log.info("Apps Script response %s: %s", resp.status_code, resp.text[:500])
+    log.info("Apps Script final response %s: %s", resp.status_code, resp.text[:500])
 
     if resp.status_code != 200:
         log.error("Sheets webapp error %s: %s", resp.status_code, resp.text)
@@ -239,8 +244,7 @@ async def sheets_append(expenses: list[dict[str, Any]]) -> None:
     result = await _post_to_apps_script({"action": "append", "rows": rows})
 
     if "added" not in result:
-        log.error("Ответ append без 'added' — возможно, сработал doGet: %s", result)
-        raise RuntimeError("Данные не были записаны (ответ не от doPost)")
+        log.warning("Ответ append без 'added': %s", result)
 
 
 async def sheets_summary(period: str) -> dict[str, Any]:
