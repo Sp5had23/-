@@ -2,8 +2,8 @@
 Expense Tracker Telegram Bot
 =============================
 Принимает сообщения о тратах на естественном языке (в т.ч. списком),
-парсит их через Gemini API и записывает в Google Таблицу
-(через Apps Script Web App вместо Service Account — так проще).
+парсит их через OpenRouter API (бесплатные LLM-модели) и записывает
+в Google Таблицу (через Apps Script Web App вместо Service Account — так проще).
 
 Примеры сообщений, которые понимает бот:
     10 забрал посылку
@@ -21,8 +21,10 @@ Expense Tracker Telegram Bot
 
 Переменные окружения (задаются в Railway -> Variables):
     TELEGRAM_BOT_TOKEN   - токен бота от @BotFather
-    GEMINI_API_KEY       - ключ Gemini API (https://aistudio.google.com/apikey)
+    OPENROUTER_API_KEY   - ключ OpenRouter (https://openrouter.ai/keys)
     SHEETS_WEBAPP_URL    - URL опубликованного Apps Script Web App
+    OPENROUTER_MODEL     - (опционально) модель, по умолчанию бесплатная
+                            "meta-llama/llama-3.3-70b-instruct:free"
     ALLOWED_USER_IDS     - (опционально) через запятую, кто может писать боту.
                             Если не задано - отвечает всем.
 """
@@ -52,22 +54,21 @@ log = logging.getLogger("expense-bot")
 # Переменные окружения
 # --------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 SHEETS_WEBAPP_URL = os.environ.get("SHEETS_WEBAPP_URL", "").strip()
 _allowed_raw = os.environ.get("ALLOWED_USER_IDS", "").strip()
 ALLOWED_USER_IDS = {
     int(x) for x in _allowed_raw.split(",") if x.strip().isdigit()
 } if _allowed_raw else None  # None = разрешено всем
 
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+OPENROUTER_MODEL = os.environ.get(
+    "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
 )
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 REQUIRED_VARS = {
     "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-    "GEMINI_API_KEY": GEMINI_API_KEY,
+    "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
     "SHEETS_WEBAPP_URL": SHEETS_WEBAPP_URL,
 }
 missing = [k for k, v in REQUIRED_VARS.items() if not v]
@@ -78,9 +79,9 @@ if missing:
     )
 
 # --------------------------------------------------------------------------
-# Промпт для Gemini: превращаем свободный текст в список трат JSON-ом
+# Промпт для LLM: превращаем свободный текст в список трат JSON-ом
 # --------------------------------------------------------------------------
-GEMINI_SYSTEM_PROMPT = """\
+EXPENSE_SYSTEM_PROMPT = """\
 Ты парсер трат для бота учёта финансов. Пользователь пишет сообщение о \
 покупках/тратах на любом языке (обычно русский или украинский), иногда \
 одной строкой, иногда списком в несколько строк.
@@ -114,30 +115,35 @@ GEMINI_SYSTEM_PROMPT = """\
 """
 
 
-async def parse_expenses_with_gemini(text: str) -> list[dict[str, Any]]:
-    """Отправляет текст в Gemini и возвращает список распарсенных трат."""
+async def parse_expenses_with_llm(text: str) -> list[dict[str, Any]]:
+    """Отправляет текст в OpenRouter и возвращает список распарсенных трат."""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
     payload = {
-        "contents": [{"parts": [{"text": text}]}],
-        "systemInstruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
-        "generationConfig": {
-            "temperature": 0.1,
-            "responseMimeType": "application/json",
-        },
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": EXPENSE_SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(GEMINI_URL, json=payload)
+        resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
 
     if resp.status_code != 200:
-        log.error("Gemini API error %s: %s", resp.status_code, resp.text)
-        raise RuntimeError(f"Ошибка Gemini API: {resp.status_code}")
+        log.error("OpenRouter API error %s: %s", resp.status_code, resp.text)
+        raise RuntimeError(f"Ошибка OpenRouter API: {resp.status_code}")
 
     data = resp.json()
     try:
-        raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+        raw_text = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
-        log.error("Неожиданный формат ответа Gemini: %s", data)
-        raise RuntimeError("Не удалось разобрать ответ Gemini") from e
+        log.error("Неожиданный формат ответа OpenRouter: %s", data)
+        raise RuntimeError("Не удалось разобрать ответ модели") from e
 
     raw_text = raw_text.strip()
     # На всякий случай снимаем возможные markdown-обёртки
@@ -150,8 +156,8 @@ async def parse_expenses_with_gemini(text: str) -> list[dict[str, Any]]:
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError as e:
-        log.error("Gemini вернул невалидный JSON: %s", raw_text)
-        raise RuntimeError("Gemini вернул невалидный JSON") from e
+        log.error("Модель вернула невалидный JSON: %s", raw_text)
+        raise RuntimeError("Модель вернула невалидный JSON") from e
 
     expenses = parsed.get("expenses", [])
     # Валидация базовых полей
@@ -167,7 +173,7 @@ async def parse_expenses_with_gemini(text: str) -> list[dict[str, Any]]:
                 "description": description,
             })
         except (KeyError, ValueError, TypeError):
-            log.warning("Пропущена некорректная запись от Gemini: %s", exp)
+            log.warning("Пропущена некорректная запись от модели: %s", exp)
             continue
 
     return clean
@@ -297,7 +303,7 @@ async def cmd_help(message: Message) -> None:
         return
     await message.answer(
         "Просто пиши траты обычным текстом, я сам пойму сумму, валюту и "
-        "описание с помощью Gemini и запишу в Google Таблицу с датой.\n\n"
+        "описание с помощью AI и запишу в Google Таблицу с датой.\n\n"
         "/today — сводка за сегодня\n"
         "/month — сводка за месяц\n"
         "/all — сводка за всё время"
@@ -360,9 +366,9 @@ async def handle_expense_message(message: Message) -> None:
     thinking_msg = await message.answer("⏳ Разбираю…")
 
     try:
-        expenses = await parse_expenses_with_gemini(text)
+        expenses = await parse_expenses_with_llm(text)
     except Exception as e:
-        log.exception("Ошибка парсинга Gemini")
+        log.exception("Ошибка парсинга LLM")
         await thinking_msg.edit_text(f"❌ Не смог разобрать сообщение: {e}")
         return
 
