@@ -182,6 +182,47 @@ async def parse_expenses_with_llm(text: str) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------
 # Работа с Google Sheets через Apps Script Web App
 # --------------------------------------------------------------------------
+# Apps Script при POST возвращает 302-редирект. httpx (и requests) по HTTP-стандарту
+# меняют POST→GET при 302, теряя тело запроса. В итоге вместо doPost выполняется
+# doGet (который возвращает {ok:true}), и данные не пишутся.
+# Решение: вручную следуем редиректам, сохраняя POST и тело.
+# --------------------------------------------------------------------------
+async def _post_to_apps_script(payload: dict) -> dict:
+    """POST в Apps Script Web App с корректной обработкой 302-редиректов."""
+    url = SHEETS_WEBAPP_URL
+    json_body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for _ in range(5):  # макс. 5 редиректов
+            resp = await client.post(url, content=json_body, headers=headers, follow_redirects=False)
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                url = resp.headers["location"]
+                log.debug("Apps Script redirect -> %s", url)
+                continue
+
+            break
+
+    log.info("Apps Script response %s: %s", resp.status_code, resp.text[:500])
+
+    if resp.status_code != 200:
+        log.error("Sheets webapp error %s: %s", resp.status_code, resp.text)
+        raise RuntimeError(f"Ошибка Google Таблицы: HTTP {resp.status_code}")
+
+    try:
+        result = resp.json()
+    except json.JSONDecodeError:
+        log.error("Sheets webapp вернул не-JSON: %s", resp.text)
+        raise RuntimeError("Google Таблица вернула неожиданный ответ")
+
+    if not result.get("ok"):
+        log.error("Sheets webapp вернул ошибку: %s", result)
+        raise RuntimeError(result.get("error", "Неизвестная ошибка Google Таблицы"))
+
+    return result
+
+
 async def sheets_append(expenses: list[dict[str, Any]]) -> None:
     """Добавляет строки трат в Google Таблицу."""
     now = datetime.now()
@@ -195,47 +236,16 @@ async def sheets_append(expenses: list[dict[str, Any]]) -> None:
         }
         for exp in expenses
     ]
-    payload = {"action": "append", "rows": rows}
+    result = await _post_to_apps_script({"action": "append", "rows": rows})
 
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.post(SHEETS_WEBAPP_URL, json=payload)
-
-    if resp.status_code != 200:
-        log.error("Sheets webapp error %s: %s", resp.status_code, resp.text)
-        raise RuntimeError("Не удалось записать в Google Таблицу")
-
-    try:
-        result = resp.json()
-    except json.JSONDecodeError:
-        log.error("Sheets webapp вернул не-JSON: %s", resp.text)
-        raise RuntimeError("Google Таблица вернула неожиданный ответ")
-
-    if not result.get("ok"):
-        log.error("Sheets webapp вернул ошибку: %s", result)
-        raise RuntimeError(result.get("error", "Неизвестная ошибка Google Таблицы"))
+    if "added" not in result:
+        log.error("Ответ append без 'added' — возможно, сработал doGet: %s", result)
+        raise RuntimeError("Данные не были записаны (ответ не от doPost)")
 
 
 async def sheets_summary(period: str) -> dict[str, Any]:
     """Запрашивает у Apps Script сводку за период: today / month / all."""
-    payload = {"action": "summary", "period": period}
-
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.post(SHEETS_WEBAPP_URL, json=payload)
-
-    if resp.status_code != 200:
-        log.error("Sheets webapp error %s: %s", resp.status_code, resp.text)
-        raise RuntimeError("Не удалось получить данные из Google Таблицы")
-
-    try:
-        result = resp.json()
-    except json.JSONDecodeError:
-        log.error("Sheets webapp вернул не-JSON: %s", resp.text)
-        raise RuntimeError("Google Таблица вернула неожиданный ответ")
-
-    if not result.get("ok"):
-        raise RuntimeError(result.get("error", "Неизвестная ошибка Google Таблицы"))
-
-    return result
+    return await _post_to_apps_script({"action": "summary", "period": period})
 
 
 def format_summary(result: dict[str, Any], title: str) -> str:
