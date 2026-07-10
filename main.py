@@ -2,7 +2,7 @@
 Expense Tracker Telegram Bot
 =============================
 Принимает сообщения о тратах на естественном языке (в т.ч. списком),
-парсит их через OpenRouter API (бесплатные LLM-модели) и записывает
+парсит их через Groq API (бесплатные быстрые LLM-модели) и записывает
 в Google Таблицу (через Apps Script Web App вместо Service Account — так проще).
 
 Примеры сообщений, которые понимает бот:
@@ -21,10 +21,10 @@ Expense Tracker Telegram Bot
 
 Переменные окружения (задаются в Railway -> Variables):
     TELEGRAM_BOT_TOKEN   - токен бота от @BotFather
-    OPENROUTER_API_KEY   - ключ OpenRouter (https://openrouter.ai/keys)
+    GROQ_API_KEY         - ключ Groq (https://console.groq.com/keys)
     SHEETS_WEBAPP_URL    - URL опубликованного Apps Script Web App
-    OPENROUTER_MODEL     - (опционально) модель, по умолчанию бесплатная
-                            "meta-llama/llama-3.3-70b-instruct:free"
+    GROQ_MODEL           - (опционально) модель, по умолчанию
+                            "llama-3.3-70b-versatile"
     ALLOWED_USER_IDS     - (опционально) через запятую, кто может писать боту.
                             Если не задано - отвечает всем.
 """
@@ -54,21 +54,21 @@ log = logging.getLogger("expense-bot")
 # Переменные окружения
 # --------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 SHEETS_WEBAPP_URL = os.environ.get("SHEETS_WEBAPP_URL", "").strip()
 _allowed_raw = os.environ.get("ALLOWED_USER_IDS", "").strip()
 ALLOWED_USER_IDS = {
     int(x) for x in _allowed_raw.split(",") if x.strip().isdigit()
 } if _allowed_raw else None  # None = разрешено всем
 
-OPENROUTER_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"
-)
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Groq — OpenAI-совместимый API, base URL: https://api.groq.com/openai/v1/
+# (аналог Retrofit .baseUrl("https://api.groq.com/openai/v1/") из Android-примера)
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 REQUIRED_VARS = {
     "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-    "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
+    "GROQ_API_KEY": GROQ_API_KEY,
     "SHEETS_WEBAPP_URL": SHEETS_WEBAPP_URL,
 }
 missing = [k for k, v in REQUIRED_VARS.items() if not v]
@@ -116,13 +116,13 @@ EXPENSE_SYSTEM_PROMPT = """\
 
 
 async def parse_expenses_with_llm(text: str) -> list[dict[str, Any]]:
-    """Отправляет текст в OpenRouter и возвращает список распарсенных трат."""
+    """Отправляет текст в Groq и возвращает список распарсенных трат."""
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": OPENROUTER_MODEL,
+        "model": GROQ_MODEL,
         "messages": [
             {"role": "system", "content": EXPENSE_SYSTEM_PROMPT},
             {"role": "user", "content": text},
@@ -132,17 +132,17 @@ async def parse_expenses_with_llm(text: str) -> list[dict[str, Any]]:
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+        resp = await client.post(GROQ_URL, headers=headers, json=payload)
 
     if resp.status_code != 200:
-        log.error("OpenRouter API error %s: %s", resp.status_code, resp.text)
-        raise RuntimeError(f"Ошибка OpenRouter API: {resp.status_code}")
+        log.error("Groq API error %s: %s", resp.status_code, resp.text)
+        raise RuntimeError(f"Ошибка Groq API: {resp.status_code}")
 
     data = resp.json()
     try:
         raw_text = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
-        log.error("Неожиданный формат ответа OpenRouter: %s", data)
+        log.error("Неожиданный формат ответа Groq: %s", data)
         raise RuntimeError("Не удалось разобрать ответ модели") from e
 
     raw_text = raw_text.strip()
