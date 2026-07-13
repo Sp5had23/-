@@ -25,6 +25,21 @@ def init_db() -> None:
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS routines (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS routine_checks (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                routine_id INTEGER NOT NULL REFERENCES routines(id) ON DELETE CASCADE,
+                date       TEXT NOT NULL,
+                UNIQUE(routine_id, date)
+            )
+        """)
 
 
 def add_expense(amount: float, currency: str, description: str) -> int:
@@ -85,3 +100,63 @@ def get_summary(rows: list[dict]) -> dict[str, float]:
     for r in rows:
         totals[r["currency"]] = totals.get(r["currency"], 0) + r["amount"]
     return {k: round(v, 2) for k, v in totals.items()}
+
+
+# ---------------------------------------------------------------------------
+# Рутины
+# ---------------------------------------------------------------------------
+def add_routine(name: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute("INSERT INTO routines (name) VALUES (?)", (name,))
+        return cur.lastrowid
+
+
+def delete_routine(routine_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM routine_checks WHERE routine_id = ?", (routine_id,))
+        conn.execute("DELETE FROM routines WHERE id = ?", (routine_id,))
+
+
+def get_routines() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM routines WHERE active = 1 ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def toggle_routine_check(routine_id: int, day: str) -> bool:
+    """Переключает чек: если был — убирает, если нет — ставит. Возвращает новое состояние."""
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM routine_checks WHERE routine_id = ? AND date = ?",
+            (routine_id, day),
+        ).fetchone()
+        if existing:
+            conn.execute("DELETE FROM routine_checks WHERE id = ?", (existing["id"],))
+            return False
+        else:
+            conn.execute(
+                "INSERT INTO routine_checks (routine_id, date) VALUES (?, ?)",
+                (routine_id, day),
+            )
+            return True
+
+
+def get_checks_for_period(start_date: str, end_date: str) -> dict[int, set[str]]:
+    """Возвращает {routine_id: {date1, date2, ...}} за период."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT routine_id, date FROM routine_checks WHERE date >= ? AND date <= ?",
+            (start_date, end_date),
+        ).fetchall()
+    result: dict[int, set[str]] = {}
+    for r in rows:
+        result.setdefault(r["routine_id"], set()).add(r["date"])
+    return result
+
+
+def get_checks_for_date(day: str) -> set[int]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT routine_id FROM routine_checks WHERE date = ?", (day,)
+        ).fetchall()
+    return {r["routine_id"] for r in rows}
