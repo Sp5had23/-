@@ -2,7 +2,7 @@ from datetime import date, datetime, timedelta
 import calendar as cal_module
 
 from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
 
 from db import (
     init_db, get_all, get_today, get_month, get_by_date,
@@ -177,6 +177,16 @@ async def expenses_today():
 async def api_all():
     rows = get_all()
     return {"count": len(rows), "totals": get_summary(rows), "items": rows}
+
+
+@app.get("/download")
+async def download_db():
+    from db import DB_PATH
+    if DB_PATH.exists():
+        return FileResponse(
+            DB_PATH, filename="expenses.db", media_type="application/octet-stream"
+        )
+    return HTMLResponse("База пока пустая", status_code=404)
 
 
 # =========================================================================
@@ -525,6 +535,12 @@ BASE_TEMPLATE = """<!DOCTYPE html>
     color: var(--accent);
     border-bottom-color: var(--accent);
   }}
+  .nav a.dl {{
+    flex: none;
+    padding: 14px 16px;
+    font-size: 1.1rem;
+    border-bottom: none;
+  }}
 
   /* --- Календарь (общий) --- */
   .cal-header {{
@@ -709,6 +725,7 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   <nav class="nav">
     <a href="/expenses" class="{exp_cls}">💰 Траты</a>
     <a href="/routines" class="{rut_cls}">📋 Рутины</a>
+    <a href="/download" class="dl">💾</a>
   </nav>
   {content}
 </div>
