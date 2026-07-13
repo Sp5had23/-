@@ -61,6 +61,25 @@ def get_all() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_by_date(day: str) -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM expenses WHERE date = ? ORDER BY id", (day,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_daily_totals(year: int, month: int) -> dict[str, float]:
+    """Суммы по дням за указанный месяц: {"2026-07-10": 15.50, ...}"""
+    prefix = f"{year:04d}-{month:02d}"
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT date, SUM(amount) as total FROM expenses WHERE date LIKE ? GROUP BY date",
+            (prefix + "%",),
+        ).fetchall()
+    return {r["date"]: round(r["total"], 2) for r in rows}
+
+
 def get_summary(rows: list[dict]) -> dict[str, float]:
     totals: dict[str, float] = {}
     for r in rows:
