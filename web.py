@@ -7,8 +7,9 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from db import (
     init_db, get_all, get_today, get_month, get_by_date,
     get_daily_totals, get_summary,
-    get_routines, add_routine, delete_routine,
-    toggle_routine_check, get_checks_for_date, get_checks_for_period,
+    get_routines, add_routine, delete_routine, routine_is_scheduled,
+    toggle_routine_check, set_routine_value, get_check_value,
+    get_checks_for_date, get_checks_for_period,
 )
 
 app = FastAPI(title="Expense Tracker")
@@ -181,22 +182,29 @@ async def api_all():
 # =========================================================================
 # Рутины — хелперы
 # =========================================================================
-def _build_routine_calendar(year: int, month: int, routines: list[dict], checks: dict[int, set[str]], selected: str | None) -> str:
+DAY_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+
+def _build_routine_calendar(year: int, month: int, routines: list[dict],
+                            checks: dict[int, dict[str, float]], selected: str | None) -> str:
     c = cal_module.Calendar(firstweekday=0)
     weeks = c.monthdayscalendar(year, month)
     today_str = date.today().isoformat()
-    total_routines = len(routines) or 1
 
     prev_m = month - 1 if month > 1 else 12
     prev_y = year if month > 1 else year - 1
     next_m = month + 1 if month < 12 else 1
     next_y = year if month < 12 else year + 1
 
-    # Подсчёт чеков по дням
-    day_counts: dict[str, int] = {}
-    for rid, dates in checks.items():
-        for d in dates:
-            day_counts[d] = day_counts.get(d, 0) + 1
+    # Подсчёт: сколько из запланированных выполнено в каждый день
+    day_done: dict[str, int] = {}
+    day_scheduled: dict[str, int] = {}
+    for ds_candidate in _month_dates(year, month):
+        scheduled = sum(1 for r in routines if routine_is_scheduled(r, ds_candidate))
+        done = sum(1 for r in routines if r["id"] in checks and ds_candidate in checks[r["id"]])
+        if scheduled > 0:
+            day_scheduled[ds_candidate] = scheduled
+            day_done[ds_candidate] = done
 
     html = f"""
     <div class="cal-header">
@@ -215,19 +223,19 @@ def _build_routine_calendar(year: int, month: int, routines: list[dict], checks:
                 html += "<td class='cal-empty'></td>"
                 continue
             ds = f"{year:04d}-{month:02d}-{d:02d}"
-            done = day_counts.get(ds, 0)
-            pct = int(done / total_routines * 100) if total_routines else 0
+            scheduled = day_scheduled.get(ds, 0)
+            done = day_done.get(ds, 0)
             cls = ["cal-day"]
             if ds == today_str:
                 cls.append("cal-today")
             if ds == selected:
                 cls.append("cal-sel")
-            if pct == 100:
+            if scheduled > 0 and done == scheduled:
                 cls.append("cal-done")
-            elif pct > 0:
+            elif done > 0:
                 cls.append("cal-partial")
 
-            label = f"<span class='cal-pct'>{done}/{len(routines)}</span>" if done > 0 else ""
+            label = f"<span class='cal-pct'>{done}/{scheduled}</span>" if done > 0 else ""
             html += (
                 f"<td class='{' '.join(cls)}'>"
                 f"<a href='/routines/day/{ds}?y={year}&m={month}'>"
@@ -238,6 +246,12 @@ def _build_routine_calendar(year: int, month: int, routines: list[dict], checks:
     return html
 
 
+def _month_dates(year: int, month: int) -> list[str]:
+    import calendar
+    _, last_day = calendar.monthrange(year, month)
+    return [f"{year:04d}-{month:02d}-{d:02d}" for d in range(1, last_day + 1)]
+
+
 def render_routines_page(year: int, month: int, day: str | None = None) -> str:
     routines = get_routines()
     start = f"{year:04d}-{month:02d}-01"
@@ -246,51 +260,146 @@ def render_routines_page(year: int, month: int, day: str | None = None) -> str:
 
     calendar_html = _build_routine_calendar(year, month, routines, checks, day)
 
-    # Чеклист на выбранный день
     show_day = day or date.today().isoformat()
     day_checks = get_checks_for_date(show_day)
 
     try:
         d = date.fromisoformat(show_day)
-        day_names = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-        day_title = f"{day_names[d.weekday()]}, {d.strftime('%d.%m.%Y')}"
+        day_title = f"{DAY_LABELS[d.weekday()]}, {d.strftime('%d.%m.%Y')}"
     except ValueError:
         day_title = show_day
+
+    # Чеклист
+    scheduled_routines = [r for r in routines if routine_is_scheduled(r, show_day)]
+    other_routines = [r for r in routines if not routine_is_scheduled(r, show_day)]
 
     checklist_html = ""
     if not routines:
         checklist_html = "<p class='muted'>Нет рутин. Добавь первую ниже.</p>"
+    elif not scheduled_routines:
+        checklist_html = "<p class='muted'>На этот день ничего не запланировано.</p>"
     else:
-        for r in routines:
-            checked = r["id"] in day_checks
-            icon = "✅" if checked else "⬜"
-            strike = " style='text-decoration:line-through;color:var(--muted)'" if checked else ""
+        for r in scheduled_routines:
+            checklist_html += _render_routine_item(r, show_day, day_checks, year, month)
+
+    if other_routines:
+        checklist_html += "<p class='muted' style='margin-top:16px;font-size:0.85rem'>Не на этот день:</p>"
+        for r in other_routines:
+            wd_labels = ", ".join(DAY_LABELS[int(x)] for x in r["weekdays"].split(",") if x.strip().isdigit())
             checklist_html += (
-                f"<div class='routine-item'>"
-                f"<a href='/routines/toggle/{r['id']}/{show_day}?y={year}&m={month}' class='routine-check'>{icon}</a>"
-                f"<span class='routine-name'{strike}>{r['name']}</span>"
+                f"<div class='routine-item' style='opacity:0.45'>"
+                f"<span class='routine-name'>{r['name']}</span>"
+                f"<span style='font-size:0.75rem;color:var(--muted)'>{wd_labels}</span>"
                 f"<a href='/routines/delete/{r['id']}?y={year}&m={month}' class='routine-del' "
-                f"onclick=\"return confirm('Удалить рутину «{r['name']}»?')\">✕</a>"
+                f"onclick=\"return confirm('Удалить?')\">✕</a>"
                 f"</div>"
             )
 
-    done_count = sum(1 for r in routines if r["id"] in day_checks)
+    done_count = sum(1 for r in scheduled_routines if r["id"] in day_checks)
+
+    # Форма добавления
+    weekday_checkboxes = ""
+    for i, label in enumerate(DAY_LABELS):
+        weekday_checkboxes += (
+            f"<label class='wd-label'>"
+            f"<input type='checkbox' name='weekdays' value='{i}' checked> {label}"
+            f"</label>"
+        )
 
     content = f"""
     {calendar_html}
     <h2>{day_title}</h2>
     <div class="stats">
-      <span class="badge {'badge-green' if done_count == len(routines) and routines else 'badge-muted'}">{done_count}/{len(routines)} выполнено</span>
+      <span class="badge {'badge-green' if done_count == len(scheduled_routines) and scheduled_routines else 'badge-muted'}">{done_count}/{len(scheduled_routines)} выполнено</span>
     </div>
     <div class="checklist">
       {checklist_html}
     </div>
-    <form action="/routines/add?y={year}&m={month}" method="post" class="add-form">
-      <input type="text" name="name" placeholder="Новая рутина…" required class="add-input">
-      <button type="submit" class="add-btn">+</button>
-    </form>
+
+    <details class="add-section">
+      <summary class="add-toggle">+ Добавить рутину</summary>
+      <form action="/routines/add?y={year}&m={month}" method="post" class="add-form-full">
+        <input type="text" name="name" placeholder="Название…" required class="add-input">
+
+        <div class="form-row">
+          <label class="form-label">Тип</label>
+          <select name="type" class="form-select" onchange="document.getElementById('counter-opts').style.display=this.value==='counter'?'flex':'none'">
+            <option value="checkbox">Галочка (да/нет)</option>
+            <option value="counter">Счётчик (число)</option>
+          </select>
+        </div>
+
+        <div class="form-row" id="counter-opts" style="display:none">
+          <input type="text" name="unit" placeholder="Единица (л, шт, мин…)" class="add-input" style="flex:1">
+          <input type="number" name="target" placeholder="Цель" step="0.1" min="0" class="add-input" style="width:90px">
+        </div>
+
+        <div class="form-row">
+          <label class="form-label">Дни</label>
+          <div class="wd-row">{weekday_checkboxes}</div>
+        </div>
+
+        <button type="submit" class="submit-btn">Добавить</button>
+      </form>
+    </details>
     """
     return _base(f"Рутины — {day_title}", content, "routines")
+
+
+def _render_routine_item(r: dict, show_day: str, day_checks: dict[int, float],
+                         year: int, month: int) -> str:
+    rid = r["id"]
+    rtype = r.get("type", "checkbox")
+    unit = r.get("unit", "")
+    target = r.get("target", 0)
+    value = day_checks.get(rid)
+
+    # Дни недели (компактно)
+    weekdays = r.get("weekdays", "0,1,2,3,4,5,6")
+    is_daily = weekdays == "0,1,2,3,4,5,6"
+    schedule_label = ""
+    if not is_daily:
+        wd_labels = "".join(DAY_LABELS[int(x)][0] for x in weekdays.split(",") if x.strip().isdigit())
+        schedule_label = f"<span class='routine-schedule'>{wd_labels}</span>"
+
+    if rtype == "counter":
+        current = value if value is not None else 0
+        target_str = f" / {target:.1f}" if target > 0 else ""
+        filled = value is not None and target > 0 and current >= target
+        bar_pct = min(int(current / target * 100), 100) if target > 0 else 0
+        bar_html = ""
+        if target > 0:
+            bar_html = f"<div class='progress-bar'><div class='progress-fill' style='width:{bar_pct}%'></div></div>"
+
+        return (
+            f"<div class='routine-item'>"
+            f"<div class='routine-counter-row'>"
+            f"<span class='routine-name{' done' if filled else ''}'>{r['name']}</span>"
+            f"{schedule_label}"
+            f"<form action='/routines/set/{rid}/{show_day}?y={year}&m={month}' method='post' class='counter-form'>"
+            f"<button type='submit' name='delta' value='-0.5' class='counter-btn'>−</button>"
+            f"<span class='counter-val'>{current:.1f}{target_str} {unit}</span>"
+            f"<button type='submit' name='delta' value='0.5' class='counter-btn'>+</button>"
+            f"</form>"
+            f"<a href='/routines/delete/{rid}?y={year}&m={month}' class='routine-del' "
+            f"onclick=\"return confirm('Удалить?')\">✕</a>"
+            f"</div>"
+            f"{bar_html}"
+            f"</div>"
+        )
+    else:
+        checked = value is not None
+        icon = "✅" if checked else "⬜"
+        strike = " done" if checked else ""
+        return (
+            f"<div class='routine-item'>"
+            f"<a href='/routines/toggle/{rid}/{show_day}?y={year}&m={month}' class='routine-check'>{icon}</a>"
+            f"<span class='routine-name{strike}'>{r['name']}</span>"
+            f"{schedule_label}"
+            f"<a href='/routines/delete/{rid}?y={year}&m={month}' class='routine-del' "
+            f"onclick=\"return confirm('Удалить?')\">✕</a>"
+            f"</div>"
+        )
 
 
 # =========================================================================
@@ -320,10 +429,34 @@ async def routines_toggle(routine_id: int, day: str, y: int | None = None, m: in
     return RedirectResponse(f"/routines/day/{day}?y={year}&m={month}", status_code=303)
 
 
+@app.post("/routines/set/{routine_id}/{day}")
+async def routines_set_value(routine_id: int, day: str,
+                             delta: float = Form(0), y: int | None = None, m: int | None = None):
+    current = get_check_value(routine_id, day) or 0
+    new_val = max(0, current + delta)
+    if new_val > 0:
+        set_routine_value(routine_id, day, new_val)
+    else:
+        # Удаляем если 0
+        from db import get_conn
+        with get_conn() as conn:
+            conn.execute(
+                "DELETE FROM routine_checks WHERE routine_id = ? AND date = ?",
+                (routine_id, day),
+            )
+    year = y or date.today().year
+    month = m or date.today().month
+    return RedirectResponse(f"/routines/day/{day}?y={year}&m={month}", status_code=303)
+
+
 @app.post("/routines/add")
-async def routines_add(name: str = Form(...), y: int | None = None, m: int | None = None):
+async def routines_add(name: str = Form(...), type: str = Form("checkbox"),
+                       unit: str = Form(""), target: float = Form(0),
+                       weekdays: list[str] = Form([]),
+                       y: int | None = None, m: int | None = None):
     if name.strip():
-        add_routine(name.strip())
+        wd = ",".join(weekdays) if weekdays else "0,1,2,3,4,5,6"
+        add_routine(name.strip(), rtype=type, unit=unit.strip(), target=target, weekdays=wd)
     year = y or date.today().year
     month = m or date.today().month
     return RedirectResponse(f"/routines?y={year}&m={month}", status_code=303)
@@ -484,22 +617,82 @@ BASE_TEMPLATE = """<!DOCTYPE html>
   .routine-del:hover {{ opacity:1; color:var(--red); }}
   .muted {{ color:var(--muted); padding:20px 0; }}
 
-  /* --- Форма добавления --- */
-  .add-form {{
-    display:flex; gap:8px; margin-top:12px;
+  .routine-name.done {{
+    text-decoration: line-through;
+    color: var(--muted);
   }}
+  .routine-schedule {{
+    font-size:0.7rem; color:var(--accent); background:rgba(108,99,255,0.1);
+    padding:2px 6px; border-radius:4px; letter-spacing:0.5px;
+  }}
+
+  /* --- Счётчик --- */
+  .routine-counter-row {{
+    display:flex; align-items:center; gap:10px; width:100%;
+  }}
+  .counter-form {{
+    display:flex; align-items:center; gap:4px; margin-left:auto;
+  }}
+  .counter-btn {{
+    width:30px; height:30px; border-radius:8px; border:1px solid var(--border);
+    background:var(--card); color:var(--text); font-size:1.1rem; cursor:pointer;
+    display:flex; align-items:center; justify-content:center;
+    transition:border-color 0.2s;
+  }}
+  .counter-btn:hover {{ border-color:var(--accent); }}
+  .counter-val {{
+    font-size:0.9rem; font-weight:600; min-width:60px; text-align:center;
+    font-variant-numeric:tabular-nums;
+  }}
+  .progress-bar {{
+    width:100%; height:4px; background:var(--border); border-radius:2px; margin-top:8px;
+  }}
+  .progress-fill {{
+    height:100%; background:var(--green); border-radius:2px; transition:width 0.3s;
+  }}
+
+  /* --- Форма добавления --- */
+  .add-section {{ margin-top:20px; }}
+  .add-toggle {{
+    cursor:pointer; color:var(--accent); font-weight:600; font-size:0.95rem;
+    padding:10px 0; list-style:none;
+  }}
+  .add-toggle::-webkit-details-marker {{ display:none; }}
+  .add-form-full {{
+    display:flex; flex-direction:column; gap:10px; margin-top:12px;
+    padding:16px; background:var(--card); border:1px solid var(--border); border-radius:12px;
+  }}
+  .form-row {{
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  }}
+  .form-label {{
+    font-size:0.85rem; color:var(--muted); min-width:40px;
+  }}
+  .form-select {{
+    flex:1; padding:8px 12px; background:var(--bg); border:1px solid var(--border);
+    border-radius:8px; color:var(--text); font-size:0.9rem; outline:none;
+  }}
+  .form-select:focus {{ border-color:var(--accent); }}
+  .wd-row {{ display:flex; gap:6px; flex-wrap:wrap; }}
+  .wd-label {{
+    font-size:0.8rem; color:var(--text); display:flex; align-items:center; gap:3px;
+    padding:4px 8px; background:var(--bg); border:1px solid var(--border);
+    border-radius:6px; cursor:pointer; transition:border-color 0.2s;
+  }}
+  .wd-label:has(input:checked) {{ border-color:var(--accent); color:var(--accent); }}
+  .wd-label input {{ display:none; }}
   .add-input {{
-    flex:1; padding:10px 14px; background:var(--card); border:1px solid var(--border);
+    flex:1; padding:10px 14px; background:var(--bg); border:1px solid var(--border);
     border-radius:10px; color:var(--text); font-size:0.95rem; outline:none;
     transition:border-color 0.2s;
   }}
   .add-input:focus {{ border-color:var(--accent); }}
   .add-input::placeholder {{ color:var(--muted); }}
-  .add-btn {{
-    width:44px; background:var(--accent); border:none; border-radius:10px;
-    color:#fff; font-size:1.4rem; cursor:pointer; transition:opacity 0.2s;
+  .submit-btn {{
+    padding:10px; background:var(--accent); border:none; border-radius:10px;
+    color:#fff; font-size:0.95rem; font-weight:600; cursor:pointer; transition:opacity 0.2s;
   }}
-  .add-btn:hover {{ opacity:0.85; }}
+  .submit-btn:hover {{ opacity:0.85; }}
 
   @media (max-width:600px) {{
     .wrap {{ padding:10px; }}
